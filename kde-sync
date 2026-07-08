@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELECTED_COMPONENTS=()
+
+usage() {
+  cat <<EOF
+Usage:
+  kde-sync backup [--component <name>] [archive_path]
+  kde-sync restore [--component <name>] <archive_path>
+
+Options:
+  --component <name>   Include one component; repeat to select several
+  --list-components    Show available component names
+  --home <path>        Override the source home directory (default: $HOME)
+  --target-home <path> Override the target home directory for restore (default: $HOME)
+  -h, --help           Show this help text
+
+Available components:
+  plasma, themes, kwin, widgets, shortcuts, lockscreen, icons
+
+Examples:
+  kde-sync backup --component kwin --component themes ~/Downloads/kde-theme-backup.tar.gz
+  kde-sync restore --component widgets ~/Downloads/kde-theme-backup.tar.gz
+  kde-sync --home /home/yourname backup ~/Downloads/kde-backup.tar.gz
+
+This backs up user-side KDE Plasma theme and extension files, including:
+- KDE config files such as kwinrc and kdeglobals
+- color schemes, Plasma themes, and icons
+- Aurorae themes, KWin scripts/effects, and Plasma widgets
+- common user-level Plasma settings
+
+Note: packages installed via apt, flatpak, or other package managers may still need
+to be reinstalled on the target PC if they provide the extension itself.
+EOF
+}
+
+require_tar() {
+  if ! command -v tar >/dev/null 2>&1; then
+    echo "tar is required but was not found." >&2
+    exit 1
+  fi
+}
+
+list_components() {
+  echo "Available components: plasma, themes, kwin, widgets, shortcuts, lockscreen, icons"
+}
+
+component_paths_for() {
+  local component="$1"
+  case "$component" in
+    plasma)
+      printf '%s\n' \
+        .config/kdeglobals \
+        .config/plasmarc \
+        .config/plasma-org.kde.plasma.desktop-appletsrc \
+        .config/plasmashellrc
+      ;;
+    themes)
+      printf '%s\n' \
+        .local/share/color-schemes \
+        .local/share/plasma/look-and-feel \
+        .local/share/plasma/desktoptheme \
+        .local/share/aurorae/themes
+      ;;
+    kwin)
+      printf '%s\n' \
+        .config/kwinrc \
+        .config/kwinrulesrc \
+        .config/kwinoutputconfig.json \
+        .local/share/kwin
+      ;;
+    widgets)
+      printf '%s\n' \
+        .local/share/plasma/plasmoids \
+        .local/share/plasma/layout-templates
+      ;;
+    shortcuts)
+      printf '%s\n' .config/kglobalshortcutsrc
+      ;;
+    lockscreen)
+      printf '%s\n' .config/kscreenlockerrc
+      ;;
+    icons)
+      printf '%s\n' .themes .icons
+      ;;
+    *)
+      echo "Unknown component: $component" >&2
+      echo "Use --list-components to see valid names." >&2
+      exit 1
+      ;;
+  esac
+}
+
+collect_paths() {
+  local base="$1"
+  local -a components=()
+
+  if [ "${#SELECTED_COMPONENTS[@]}" -eq 0 ]; then
+    components=(plasma themes kwin widgets shortcuts lockscreen icons)
+  else
+    components=("${SELECTED_COMPONENTS[@]}")
+  fi
+
+  local -A seen=()
+  local -a existing=()
+  local component
+  local p
+
+  for component in "${components[@]}"; do
+    while IFS= read -r p; do
+      if [ -n "$p" ] && [ -e "$base/$p" ] && [ -z "${seen[$p]+x}" ]; then
+        existing+=("$p")
+        seen["$p"]=1
+      fi
+    done < <(component_paths_for "$component")
+  done
+
+  if [ "${#existing[@]}" -eq 0 ]; then
+    echo "No matching KDE files were found in $base for the selected components." >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${existing[@]}"
+}
+
+backup() {
+  require_tar
+
+  local source_home="$1"
+  local target="$2"
+  local default_target="$source_home/.local/share/kde-theme-backups/kde-theme-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+  if [ -z "$target" ]; then
+    target="$default_target"
+  fi
+
+  mkdir -p "$(dirname "$target")"
+
+  local -a paths=()
+  mapfile -t paths < <(collect_paths "$source_home")
+
+  echo "Creating KDE backup archive from $source_home..."
+  if [ "${#SELECTED_COMPONENTS[@]}" -gt 0 ]; then
+    echo "Selected components: ${SELECTED_COMPONENTS[*]}"
+  fi
+  tar -czf "$target" -C "$source_home" "${paths[@]}"
+  echo "Backup created: $target"
+}
+
+restore() {
+  require_tar
+
+  local archive="$1"
+  local target_home="$2"
+
+  if [ -z "$archive" ]; then
+    echo "Please provide a backup archive path." >&2
+    usage >&2
+    exit 1
+  fi
+
+  if [ ! -f "$archive" ]; then
+    echo "Backup archive not found: $archive" >&2
+    exit 1
+  fi
+
+  local -a paths=()
+  if [ "${#SELECTED_COMPONENTS[@]}" -gt 0 ]; then
+    mapfile -t paths < <(collect_paths "$HOME")
+    echo "Restoring selected KDE components from $archive into $target_home"
+    tar -xzf "$archive" -C "$target_home" "${paths[@]}"
+  else
+    echo "Restoring KDE theme and extensions from $archive into $target_home"
+    tar -xzf "$archive" -C "$target_home"
+  fi
+  echo "Restore complete. Log out and back in or restart Plasma to apply the changes."
+}
+
+main() {
+  local action=""
+  local source_home="${KDE_SYNC_HOME:-$HOME}"
+  local target_home="${KDE_SYNC_TARGET_HOME:-$HOME}"
+  local archive_path=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      backup)
+        action="backup"
+        shift
+        ;;
+      restore)
+        action="restore"
+        shift
+        ;;
+      --component)
+        if [ "$#" -lt 2 ]; then
+          echo "Missing value for --component" >&2
+          exit 1
+        fi
+        SELECTED_COMPONENTS+=("$2")
+        shift 2
+        ;;
+      --list-components)
+        list_components
+        exit 0
+        ;;
+      --home)
+        if [ "$#" -lt 2 ]; then
+          echo "Missing value for --home" >&2
+          exit 1
+        fi
+        source_home="$2"
+        shift 2
+        ;;
+      --target-home)
+        if [ "$#" -lt 2 ]; then
+          echo "Missing value for --target-home" >&2
+          exit 1
+        fi
+        target_home="$2"
+        shift 2
+        ;;
+      -h|--help|help)
+        usage
+        exit 0
+        ;;
+      *)
+        if [ -z "$archive_path" ]; then
+          archive_path="$1"
+          shift
+        else
+          echo "Unexpected argument: $1" >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done
+
+  if [ -z "$action" ]; then
+    usage >&2
+    exit 1
+  fi
+
+  case "$action" in
+    backup)
+      backup "$source_home" "$archive_path"
+      ;;
+    restore)
+      restore "$archive_path" "$target_home"
+      ;;
+  esac
+}
+
+main "$@"
